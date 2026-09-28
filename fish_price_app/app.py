@@ -7,9 +7,10 @@ import streamlit as st
 
 from price_parser import group_price_rows, read_price_template
 from price_store import (
-    apply_sheet, configure_database, delete_product_group, export_backup_xlsx,
-    import_backup_xlsx, list_history, list_prices, list_product_groups,
-    manual_update, merge_product_groups, record_order_counts, resolve_sheet_products,
+    apply_sheet, configure_database, delete_product_group, exclude_products, export_backup_xlsx,
+    import_backup_xlsx, list_excluded_products, list_history, list_prices, list_product_groups,
+    list_product_history, manual_update, merge_product_groups, record_order_counts,
+    remove_product_from_group, resolve_sheet_products, restore_excluded_products,
 )
 
 
@@ -125,15 +126,19 @@ with st.sidebar:
                         f"{incoming['date']} 已处理：价格新增或更新 {price_stats['changed']} 项，"
                         f"未变或较旧而跳过 {price_stats['skipped']} 项。"
                     )
-                    if conflict_names:
-                        message += " 报价冲突、未自动更新的归并商品：" + "、".join(conflict_names)
+                    message = (
+                        f"{incoming['date']} 已处理：价格变更 {price_stats['changed']} 项，"
+                        f"同价刷新日期 {price_stats['unchanged']} 项，较旧或同日已处理 {price_stats['skipped']} 项。"
+                        + (" 报价冲突、未自动更新：" + "、".join(conflict_names) if conflict_names else "")
+                    )
                     st.session_state["price_flash"] = message
                     st.rerun()
                 except Exception as exc:
                     st.error(f"读取或更新失败：{exc}")
 
-        with st.expander("归并相同品种", expanded=False):
-            st.caption("从现有品种中选择要合并的项目，再设置合并后显示的品名。价格与下单次数会汇总到同一栏。")
+        st.markdown("**已设置的归并**")
+        st.caption("每项默认折叠；展开后可查看、添加或移除品种。")
+        with st.expander("新建品种归并", expanded=False):
             product_choices = {
                 row["product_key"]: f"{row['product_name']}  ·  ¥{row['supplier_quote_jpy']:,.0f}"
                 for row in current
@@ -156,17 +161,43 @@ with st.sidebar:
                     st.rerun()
                 except Exception as exc:
                     st.error(f"保存归并失败：{exc}")
-            groups = list_product_groups()
-            if groups:
-                st.markdown("**已设置的归并**")
-                for index, group in enumerate(groups):
-                    aliases_label = "、".join(group["aliases"]) or "暂无别名"
-                    st.caption(f"{group['canonical_name']} ← {aliases_label}")
-                    if st.button("取消此归并", key=f"ungroup_{index}"):
-                        delete_product_group(group["canonical_key"])
-                        st.session_state.pop("price_backup_data", None)
-                        st.session_state["price_flash"] = f"已取消「{group['canonical_name']}」的归并；原始商品记录已恢复显示。"
-                        st.rerun()
+        groups = list_product_groups()
+        for index, group in enumerate(groups):
+            with st.expander(f"{group['canonical_name']} · {len(group['members'])} 个品种", expanded=False):
+                for member_index, member in enumerate(group["members"]):
+                    name_col, remove_col = st.columns([5, 1])
+                    name_col.write(member["name"])
+                    if remove_col.button("移除", key=f"remove_member_{index}_{member_index}"):
+                        try:
+                            remove_product_from_group(group["canonical_key"], member["key"])
+                            st.session_state.pop("price_backup_data", None)
+                            st.session_state["price_flash"] = f"已从「{group['canonical_name']}」移除「{member['name']}」。"
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"移除失败：{exc}")
+
+                add_choices = {
+                    row["product_key"]: f"{row['product_name']}  ·  ¥{row['supplier_quote_jpy']:,.0f}"
+                    for row in current if row["product_key"] != group["canonical_key"]
+                }
+                if add_choices:
+                    add_keys = st.multiselect(
+                        "继续添加现有品种", options=list(add_choices),
+                        format_func=lambda key: add_choices[key], key=f"add_members_{group['canonical_key']}",
+                    )
+                    if st.button("添加到此归并", key=f"add_group_{index}", disabled=not add_keys):
+                        try:
+                            merge_product_groups(group["canonical_name"], [group["canonical_key"], *add_keys])
+                            st.session_state.pop("price_backup_data", None)
+                            st.session_state["price_flash"] = f"已将所选品种添加到「{group['canonical_name']}」。"
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"添加失败：{exc}")
+                if st.button("取消整个归并", key=f"ungroup_{index}"):
+                    delete_product_group(group["canonical_key"])
+                    st.session_state.pop("price_backup_data", None)
+                    st.session_state["price_flash"] = f"已取消「{group['canonical_name']}」的归并；原商品恢复分别显示。"
+                    st.rerun()
 
         if current:
             with st.expander("手动修改价格", expanded=False):
@@ -217,7 +248,23 @@ with st.sidebar:
 if st.session_state.get("price_flash"):
     st.success(st.session_state.pop("price_flash"))
 
-st.subheader("海鲜最新报价")
+st.subheader("最近 7 天有价格变化的商品")
+recent_history = list_history(100, days=7)
+if recent_history:
+    recent_df = pd.DataFrame([{
+        "品种": row["product_name"],
+        "鱼商报价(¥)": row["supplier_quote_jpy"],
+        "更新日期": display_date(row["updated_at"]),
+    } for row in recent_history])
+    st.dataframe(recent_df, use_container_width=True, hide_index=True, height=table_height(len(recent_df)), column_config={
+        "品种": st.column_config.TextColumn(width="medium"),
+        "鱼商报价(¥)": st.column_config.NumberColumn(width="small", format="¥%.2f"),
+        "更新日期": st.column_config.TextColumn(width="small"),
+    })
+else:
+    st.caption("最近 7 天没有记录到价格变化。")
+
+st.subheader("海鲜最新报价与下单次数")
 if current:
     filter_col, sort_col = st.columns([3, 1])
     search = filter_col.text_input("搜索品种 / Size", key="catalog_search", placeholder="例如：ハマチ、350g")
@@ -239,31 +286,59 @@ if current:
         "鱼商报价(¥)": row["supplier_quote_jpy"],
         "更新日期": display_date(row["updated_at"]),
     } for row in shown])
-    st.dataframe(catalog_df, use_container_width=True, hide_index=True, height=table_height(len(catalog_df)), column_config={
+    catalog_event = st.dataframe(catalog_df, use_container_width=True, hide_index=True, height=table_height(len(catalog_df)), column_config={
         "品种": st.column_config.TextColumn(width="medium"),
         "下单次数": st.column_config.NumberColumn(width="small", format="%d"),
         "鱼商报价(¥)": st.column_config.NumberColumn(width="small", format="¥%.2f"),
         "更新日期": st.column_config.TextColumn(width="small"),
-    })
+    }, on_select="rerun", selection_mode="single-row", key="catalog_table")
+    st.caption("点击商品行，可查看该商品的价格变更记录。")
+    current_catalog_fingerprint = tuple(row["product_key"] for row in shown)
+    previous_catalog_fingerprint = st.session_state.get("catalog_fingerprint")
+    st.session_state["catalog_fingerprint"] = current_catalog_fingerprint
+    selected_indices = catalog_event.selection.rows if previous_catalog_fingerprint == current_catalog_fingerprint else []
+    if selected_indices and selected_indices[0] < len(shown):
+        selected_product = shown[selected_indices[0]]
+        with st.expander(f"{selected_product['product_name']} · 价格变更记录", expanded=True):
+            if role == "admin" and st.button(
+                "从商品列表移除并停止后续统计",
+                key=f"exclude_selected_{selected_product['product_key']}",
+            ):
+                exclude_products(selected_product["member_keys"])
+                st.session_state.pop("price_backup_data", None)
+                st.session_state["price_flash"] = f"已将「{selected_product['product_name']}」从列表移除，可在下方恢复。"
+                st.rerun()
+            product_history = list_product_history(
+                selected_product["product_key"], selected_product["member_keys"]
+            )
+            if product_history:
+                detail_df = pd.DataFrame([{
+                    "更新日期": display_date(row["updated_at"]),
+                    "鱼商报价(¥)": row["supplier_quote_jpy"],
+                    "更新来源": row["source"],
+                } for row in product_history])
+                st.dataframe(detail_df, use_container_width=True, hide_index=True, height=table_height(len(detail_df)), column_config={
+                    "更新日期": st.column_config.TextColumn(width="small"),
+                    "鱼商报价(¥)": st.column_config.NumberColumn(width="small", format="¥%.2f"),
+                    "更新来源": st.column_config.TextColumn(width="small"),
+                })
+            else:
+                st.caption("暂时没有这件商品的价格变更记录。")
+
 else:
     st.info("价格库目前为空。管理员可在左侧迁移本机价格库，或上传当天价格表。")
 
-st.subheader("最近价格更新记录")
-history = list_history(100)
-if history:
-    history_search = st.text_input("筛选更新记录", key="history_search", placeholder="输入品种名称筛选")
-    visible_history = [row for row in history if not history_search or history_search.casefold() in row["product_name"].casefold()]
-    history_df = pd.DataFrame([{
-        "品种": row["product_name"],
-        "鱼商报价(¥)": row["supplier_quote_jpy"],
-        "更新日期": display_date(row["updated_at"]),
-        "更新来源": row["source"],
-    } for row in visible_history])
-    st.dataframe(history_df, use_container_width=True, hide_index=True, height=table_height(len(history_df)), column_config={
-        "品种": st.column_config.TextColumn(width="medium"),
-        "鱼商报价(¥)": st.column_config.NumberColumn(width="small", format="¥%.2f"),
-        "更新日期": st.column_config.TextColumn(width="small"),
-        "更新来源": st.column_config.TextColumn(width="small"),
-    })
-else:
-    st.caption("还没有价格更新记录。")
+if role == "admin":
+    with st.expander("恢复已移除的品种", expanded=False):
+        excluded = list_excluded_products()
+        if excluded:
+            excluded_choices = {row["product_key"]: row["product_name"] for row in excluded}
+            restore_keys = st.multiselect(
+                "已忽略品种（可选择恢复）", options=list(excluded_choices),
+                format_func=lambda key: excluded_choices[key], key="restore_products_choice",
+            )
+            if st.button("恢复所选品种", key="restore_products_button", disabled=not restore_keys):
+                restore_excluded_products(restore_keys)
+                st.session_state.pop("price_backup_data", None)
+                st.session_state["price_flash"] = "已恢复所选品种；后续价格表会重新更新它们。"
+                st.rerun()

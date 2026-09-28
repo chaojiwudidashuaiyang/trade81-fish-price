@@ -25,6 +25,17 @@ ALIASES = {
 }
 
 
+def is_ignored_product(value: Any) -> bool:
+    """Return true for product lines assigned to other owners."""
+    if value is None:
+        return False
+    text = unicodedata.normalize("NFKC", str(value)).strip()
+    folded = text.casefold()
+    return text.startswith("A") or any(token in folded for token in (
+        "魚箱", "鱼箱", "fishbox", "fish box", "fish-box",
+    ))
+
+
 def _used_cells(ws) -> dict[tuple[int, int], Any]:
     # Some supplied workbooks have formatting extending to XFD. Only visit
     # cells that actually contain content.
@@ -101,8 +112,8 @@ def read_price_template(file) -> dict[str, Any]:
         product = product.strip()
         if product.startswith("■"):
             continue
-        # Uppercase A-prefixed items are sea urchin lines handled by another owner.
-        if product.startswith("A"):
+        # Sea urchin and fish-box lines are handled by other owners.
+        if is_ignored_product(product):
             continue
         quote = _number(cells.get((r, 9)))
         rows.append({
@@ -151,7 +162,7 @@ def read_order_template(file) -> dict[str, Any]:
             product = value.strip()
             if not product or product.startswith("■") or product in {"產品名稱", "产品名称"}:
                 continue
-            if product.startswith("A"):
+            if is_ignored_product(product):
                 continue
             canonical = canonical_product_name(product)
             key = product_key(product)
