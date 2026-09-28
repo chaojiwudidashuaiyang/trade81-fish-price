@@ -80,6 +80,15 @@ def connect() -> _Connection:
                 updated_by TEXT NOT NULL DEFAULT ''
             )
         """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS order_daily_counts (
+                order_date TEXT NOT NULL,
+                product_key TEXT NOT NULL,
+                product_name TEXT NOT NULL,
+                order_count BIGINT NOT NULL,
+                PRIMARY KEY(order_date, product_key)
+            )
+        """)
         db.execute("ALTER TABLE price_catalog ADD COLUMN IF NOT EXISTS updated_by TEXT NOT NULL DEFAULT ''")
         db.execute("ALTER TABLE price_history ADD COLUMN IF NOT EXISTS updated_by TEXT NOT NULL DEFAULT ''")
         db.commit()
@@ -111,6 +120,15 @@ def connect() -> _Connection:
             updated_by TEXT NOT NULL DEFAULT ''
         )
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS order_daily_counts (
+            order_date TEXT NOT NULL,
+            product_key TEXT NOT NULL,
+            product_name TEXT NOT NULL,
+            order_count INTEGER NOT NULL,
+            PRIMARY KEY(order_date, product_key)
+        )
+    """)
     # Add the audit field to a local database created by an earlier app version.
     for table in ("price_catalog", "price_history"):
         columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -135,8 +153,51 @@ def db_session():
 
 def list_prices() -> list[dict[str, Any]]:
     with db_session() as db:
-        rows = db.execute("SELECT * FROM price_catalog ORDER BY LOWER(product_name)").fetchall()
+        rows = db.execute("""
+            SELECT p.*,
+                   COALESCE(o.order_count, 0) AS order_count
+            FROM price_catalog AS p
+            LEFT JOIN (
+                SELECT product_key, SUM(order_count) AS order_count
+                FROM order_daily_counts
+                GROUP BY product_key
+            ) AS o ON o.product_key = p.product_key
+            ORDER BY COALESCE(o.order_count, 0) DESC, LOWER(p.product_name)
+        """).fetchall()
     return [dict(row) for row in rows]
+
+
+def record_order_counts(sheet: dict[str, Any]) -> int:
+    """Replace one date's counts with occurrences of each item in the uploaded sheet.
+
+    Each product row is one order occurrence (the quantity column is not used).
+    Re-uploading a corrected workbook for the same date replaces that date's counts,
+    so retries do not inflate cumulative totals.
+    """
+    order_date = str(sheet.get("date") or "")
+    if not order_date:
+        raise ValueError("订单统计需要有有效日期。")
+
+    counts: dict[str, dict[str, Any]] = {}
+    for item in sheet.get("rows", []):
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        if key not in counts:
+            counts[key] = {
+                "name": item.get("canonical_name") or item.get("product") or key,
+                "count": 0,
+            }
+        counts[key]["count"] += 1
+
+    with db_session() as db:
+        db.execute("DELETE FROM order_daily_counts WHERE order_date=?", (order_date,))
+        for key, item in counts.items():
+            db.execute("""
+                INSERT INTO order_daily_counts(order_date, product_key, product_name, order_count)
+                VALUES (?, ?, ?, ?)
+            """, (order_date, key, item["name"], item["count"]))
+    return sum(item["count"] for item in counts.values())
 
 
 def list_history(limit: int | None = 30) -> list[dict[str, Any]]:
@@ -218,9 +279,23 @@ def export_backup_xlsx() -> bytes:
     history.append(["product_key", "product_name", "supplier_quote_jpy", "source_date", "updated_at", "source", "updated_by"])
     for row in reversed(list_history(limit=None)):
         history.append([row.get(k) for k in ("product_key", "product_name", "supplier_quote_jpy", "source_date", "updated_at", "source", "updated_by")])
+    counts = wb.create_sheet("每日下单统计")
+    counts.append(["order_date", "product_key", "product_name", "order_count"])
+    for row in list_order_counts():
+        counts.append([row.get(k) for k in ("order_date", "product_key", "product_name", "order_count")])
     stream = BytesIO()
     wb.save(stream)
     return stream.getvalue()
+
+
+def list_order_counts() -> list[dict[str, Any]]:
+    with db_session() as db:
+        rows = db.execute("""
+            SELECT order_date, product_key, product_name, order_count
+            FROM order_daily_counts
+            ORDER BY order_date, product_key
+        """).fetchall()
+    return [dict(row) for row in rows]
 
 
 def import_backup_xlsx(file) -> int:
@@ -258,5 +333,22 @@ def import_backup_xlsx(file) -> int:
                     str(row.get("product_key") or ""), str(row.get("product_name") or ""),
                     float(row.get("supplier_quote_jpy") or 0), str(row.get("source_date") or ""),
                     str(row.get("updated_at") or ""), str(row.get("source") or "迁移导入"), str(row.get("updated_by") or ""),
+                ))
+        if "每日下单统计" in wb.sheetnames:
+            counts_ws = wb["每日下单统计"]
+            count_headers = [cell.value for cell in counts_ws[1]]
+            for values in counts_ws.iter_rows(min_row=2, values_only=True):
+                if not any(v is not None for v in values):
+                    continue
+                row = dict(zip(count_headers, values))
+                db.execute("""
+                    INSERT INTO order_daily_counts(order_date, product_key, product_name, order_count)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(order_date, product_key) DO UPDATE SET
+                        product_name=excluded.product_name,
+                        order_count=excluded.order_count
+                """, (
+                    str(row.get("order_date") or ""), str(row.get("product_key") or ""),
+                    str(row.get("product_name") or ""), int(row.get("order_count") or 0),
                 ))
     return len(records)

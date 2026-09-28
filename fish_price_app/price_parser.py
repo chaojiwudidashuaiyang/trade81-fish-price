@@ -108,6 +108,54 @@ def read_price_template(file) -> dict[str, Any]:
     return {"date": report_date, "sheet": ws.title, "factor": factor, "rows": rows}
 
 
+def read_order_template(file) -> dict[str, Any]:
+    """Read a daily order workbook to count product order lines without prices."""
+    wb = load_workbook(file, data_only=True, read_only=False)
+    rows: list[dict[str, Any]] = []
+    report_date = ""
+
+    for ws in wb.worksheets:
+        cells = _used_cells(ws)
+        if not report_date:
+            # Order workbooks usually place a title such as 新石下單 2026.9.28
+            # near the top of the first sheet.
+            for (r, _c), value in sorted(cells.items()):
+                if r > 12:
+                    continue
+                parsed = _date_text(value)
+                if parsed and re.fullmatch(r"20\d{2}-\d{2}-\d{2}", parsed):
+                    report_date = parsed
+                    break
+
+        header_row = None
+        product_col = None
+        for r in range(1, min(max((row for row, _col in cells), default=1), 20) + 1):
+            row_values = {str(v).strip() for (rr, _c), v in cells.items() if rr == r}
+            if {"產品名稱", "數量", "單位"}.issubset(row_values):
+                header_row = r
+                product_col = next(c for (rr, c), v in cells.items() if rr == r and str(v).strip() == "產品名稱")
+                break
+        if header_row is None or product_col is None:
+            continue
+
+        for (r, c), value in cells.items():
+            if r <= header_row or c != product_col or not isinstance(value, str):
+                continue
+            product = value.strip()
+            if not product or product.startswith("■") or product in {"產品名稱", "产品名称"}:
+                continue
+            canonical = canonical_product_name(product)
+            key = product_key(product)
+            if key:
+                rows.append({"product": product, "canonical_name": canonical, "key": key})
+
+    if not rows:
+        raise ValueError("找不到每日下单模板中的商品行；需要有“產品名稱、數量、單位”表头。")
+    if not report_date:
+        raise ValueError("无法从每日下单模板标题读取日期。")
+    return {"date": report_date, "rows": rows}
+
+
 def group_price_rows(sheet: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, list[float]]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in sheet["rows"]:

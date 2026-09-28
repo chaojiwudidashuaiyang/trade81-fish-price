@@ -1,6 +1,6 @@
 # Trade81 海鲜价格库：免费共享版准备包
 
-此版本保留本机 SQLite 模式，也支持 Supabase PostgreSQL 共享数据库、Google 登录、管理员 / 只读权限和本机数据迁移。
+此版本保留本机 SQLite 模式，也支持 Supabase PostgreSQL 共享数据库、Google 登录、管理员 / 只读权限和本机数据迁移。价格页为全宽查看，默认按累计下单行数排序；管理员的上传、手动修改及迁移操作放在折叠工具区。
 
 ## 本机启动
 
@@ -24,9 +24,9 @@ Windows 本机数据仍保存在 `%LOCALAPPDATA%\Trade81FishPrice\prices.db`。
 
 ## 免费云端试运行的顺序
 
-### 1. 上传程序到 GitHub 私有仓库
+### 1. 上传程序到 GitHub 仓库
 
-创建一个 **Private repository**，上传此文件夹中的程序文件。不要上传 `.venv`、价格数据库文件或真实的 `secrets.toml`。`.gitignore` 已排除这些内容。
+Streamlit Community Cloud 免费公开部署需要公开仓库，因此本项目仓库为 **Public**。任何人都能查看程序代码；价格数据放在 Supabase，数据库和 OAuth 密钥只放在 Streamlit Secrets。不要上传 `.venv`、价格数据库文件或真实的 `secrets.toml`。`.gitignore` 已排除这些内容。
 
 ### 2. 创建 Supabase 免费项目
 
@@ -34,7 +34,7 @@ Windows 本机数据仍保存在 `%LOCALAPPDATA%\Trade81FishPrice\prices.db`。
 
 ### 3. 部署到 Streamlit Community Cloud
 
-使用 GitHub 账号登录 Streamlit Community Cloud，选择私有仓库，部署 `app.py`。先保持应用为 private。首次部署后会显示数据库未配置，这是预期状态，下一步添加 Secrets 后即可连接。
+使用 GitHub 账号登录 Streamlit Community Cloud，选择仓库并部署 `fish_price_app/app.py`。应用网页需要 Google 登录，Secrets 里的访问名单决定管理员和只读用户。
 
 ### 4. 在 Streamlit 的 Secrets 中填入配置
 
@@ -45,6 +45,8 @@ Windows 本机数据仍保存在 `%LOCALAPPDATA%\Trade81FishPrice\prices.db`。
 - `[access]`：你自己的邮箱放在 `admin_emails`；同事邮箱放在 `viewer_emails`。
 
 不要把真实密码、Client Secret 或连接 URI 提交到 GitHub，也不要发到聊天中。
+
+下单次数按两份已上传的订单 / 价格模板中商品行出现次数累计，不按数量列换算。同一天模板再次上传时会替换该日计数，因此重复上传不会重复加总。也可以上传“每日下单表”单独更新某一天的统计，不修改价格。若要统计程序启用前的历史订单，需要补传历史日期模板或每日下单表。
 
 ### 5. 配置 Google 登录
 
@@ -58,7 +60,7 @@ https://YOUR-APP.streamlit.app/oauth2callback
 
 ### 6. 邀请同事
 
-在 Streamlit app 的 Share / Settings 中将同事邮箱加入 private viewers；同时将他们的 Google 邮箱加入 Secrets 的 `viewer_emails`。两处都需要允许。管理员邮箱只放进 `admin_emails`，因此只有管理员可以上传价格表和手动修改。
+在应用处于 Google OAuth 测试模式时，把同事邮箱加入 Google Auth Platform 的“目标对象 → 测试用户”，并在 Streamlit Secrets 的 `viewer_emails` 中加入他们。管理员邮箱只放进 `admin_emails`，因此只有管理员可以上传价格表和手动修改。
 
 ### 7. 迁移本机价格
 
@@ -68,4 +70,4 @@ https://YOUR-APP.streamlit.app/oauth2callback
 
 - Streamlit Community Cloud 的应用连续 12 小时没有访问会休眠；有人打开后可以唤醒。
 - Supabase Free 项目连续一周无活动会暂停。该方案适合试运行，长期业务使用前要考虑备份与可用性。
-- 私有 Streamlit app 只能邀请特定邮箱查看。应用里还会再用 Google 登录名单区分管理员和只读同事。
+- 仓库代码公开，但应用页面要求 Google 登录；Secrets 访问名单会区分管理员和只读同事。
