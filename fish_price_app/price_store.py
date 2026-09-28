@@ -13,11 +13,15 @@ from openpyxl import Workbook, load_workbook
 
 
 _DATABASE_URL: str | None = None
+_SCHEMA_TARGET: str | None = None
 
 
 def configure_database(database_url: str | None) -> None:
-    global _DATABASE_URL
-    _DATABASE_URL = database_url or None
+    global _DATABASE_URL, _SCHEMA_TARGET
+    normalized = database_url or None
+    if normalized != _DATABASE_URL:
+        _SCHEMA_TARGET = None
+    _DATABASE_URL = normalized
 
 
 class _Connection:
@@ -48,6 +52,7 @@ def _local_path() -> Path:
 
 
 def connect() -> _Connection:
+    global _SCHEMA_TARGET
     postgres = bool(_DATABASE_URL)
     if postgres:
         try:
@@ -57,7 +62,9 @@ def connect() -> _Connection:
             raise RuntimeError("云端数据库驱动未安装；请确认 requirements.txt 已包含 psycopg。") from exc
         raw = psycopg.connect(_DATABASE_URL, row_factory=dict_row, connect_timeout=15, prepare_threshold=None)
         db = _Connection(raw, True)
-        db.execute("""
+        target = f"postgres:{_DATABASE_URL}"
+        if _SCHEMA_TARGET != target:
+            db.execute("""
             CREATE TABLE IF NOT EXISTS price_catalog (
                 product_key TEXT PRIMARY KEY,
                 product_name TEXT NOT NULL,
@@ -67,8 +74,8 @@ def connect() -> _Connection:
                 source TEXT NOT NULL,
                 updated_by TEXT NOT NULL DEFAULT ''
             )
-        """)
-        db.execute("""
+            """)
+            db.execute("""
             CREATE TABLE IF NOT EXISTS price_history (
                 id BIGSERIAL PRIMARY KEY,
                 product_key TEXT NOT NULL,
@@ -79,8 +86,8 @@ def connect() -> _Connection:
                 source TEXT NOT NULL,
                 updated_by TEXT NOT NULL DEFAULT ''
             )
-        """)
-        db.execute("""
+            """)
+            db.execute("""
             CREATE TABLE IF NOT EXISTS order_daily_counts (
                 order_date TEXT NOT NULL,
                 product_key TEXT NOT NULL,
@@ -88,24 +95,31 @@ def connect() -> _Connection:
                 order_count BIGINT NOT NULL,
                 PRIMARY KEY(order_date, product_key)
             )
-        """)
-        db.execute("""
+            """)
+            db.execute("""
             CREATE TABLE IF NOT EXISTS product_aliases (
                 alias_key TEXT PRIMARY KEY,
                 alias_name TEXT NOT NULL,
                 canonical_key TEXT NOT NULL,
                 canonical_name TEXT NOT NULL
             )
-        """)
-        db.execute("ALTER TABLE price_catalog ADD COLUMN IF NOT EXISTS updated_by TEXT NOT NULL DEFAULT ''")
-        db.execute("ALTER TABLE price_history ADD COLUMN IF NOT EXISTS updated_by TEXT NOT NULL DEFAULT ''")
-        db.commit()
+            """)
+            db.execute("ALTER TABLE price_catalog ADD COLUMN IF NOT EXISTS updated_by TEXT NOT NULL DEFAULT ''")
+            db.execute("ALTER TABLE price_history ADD COLUMN IF NOT EXISTS updated_by TEXT NOT NULL DEFAULT ''")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_price_history_product_key ON price_history(product_key)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_order_counts_product_key ON order_daily_counts(product_key)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_product_aliases_canonical_key ON product_aliases(canonical_key)")
+            db.commit()
+            _SCHEMA_TARGET = target
         return db
 
-    raw = sqlite3.connect(_local_path())
+    path = _local_path()
+    target = f"sqlite:{path.resolve()}"
+    raw = sqlite3.connect(path)
     raw.row_factory = sqlite3.Row
     db = _Connection(raw, False)
-    db.execute("""
+    if _SCHEMA_TARGET != target:
+        db.execute("""
         CREATE TABLE IF NOT EXISTS price_catalog (
             product_key TEXT PRIMARY KEY,
             product_name TEXT NOT NULL,
@@ -115,8 +129,8 @@ def connect() -> _Connection:
             source TEXT NOT NULL,
             updated_by TEXT NOT NULL DEFAULT ''
         )
-    """)
-    db.execute("""
+        """)
+        db.execute("""
         CREATE TABLE IF NOT EXISTS price_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             product_key TEXT NOT NULL,
@@ -127,8 +141,8 @@ def connect() -> _Connection:
             source TEXT NOT NULL,
             updated_by TEXT NOT NULL DEFAULT ''
         )
-    """)
-    db.execute("""
+        """)
+        db.execute("""
         CREATE TABLE IF NOT EXISTS order_daily_counts (
             order_date TEXT NOT NULL,
             product_key TEXT NOT NULL,
@@ -136,21 +150,25 @@ def connect() -> _Connection:
             order_count INTEGER NOT NULL,
             PRIMARY KEY(order_date, product_key)
         )
-    """)
-    db.execute("""
+        """)
+        db.execute("""
         CREATE TABLE IF NOT EXISTS product_aliases (
             alias_key TEXT PRIMARY KEY,
             alias_name TEXT NOT NULL,
             canonical_key TEXT NOT NULL,
             canonical_name TEXT NOT NULL
         )
-    """)
-    # Add the audit field to a local database created by an earlier app version.
-    for table in ("price_catalog", "price_history"):
-        columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
-        if "updated_by" not in columns:
-            db.execute(f"ALTER TABLE {table} ADD COLUMN updated_by TEXT NOT NULL DEFAULT ''")
-    db.commit()
+        """)
+        # Add the audit field to a local database created by an earlier app version.
+        for table in ("price_catalog", "price_history"):
+            columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "updated_by" not in columns:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN updated_by TEXT NOT NULL DEFAULT ''")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_price_history_product_key ON price_history(product_key)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_order_counts_product_key ON order_daily_counts(product_key)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_product_aliases_canonical_key ON product_aliases(canonical_key)")
+        db.commit()
+        _SCHEMA_TARGET = target
     return db
 
 
@@ -170,7 +188,10 @@ def db_session():
 def list_prices() -> list[dict[str, Any]]:
     with db_session() as db:
         price_rows = [dict(row) for row in db.execute("SELECT * FROM price_catalog").fetchall()]
-        count_rows = [dict(row) for row in db.execute("SELECT product_key, SUM(order_count) AS order_count FROM order_daily_counts GROUP BY product_key").fetchall()]
+        count_rows = [dict(row) for row in db.execute(
+            "SELECT product_key, product_name, SUM(order_count) AS order_count "
+            "FROM order_daily_counts GROUP BY product_key, product_name"
+        ).fetchall()]
         alias_rows = [dict(row) for row in db.execute("SELECT alias_key, alias_name, canonical_key, canonical_name FROM product_aliases").fetchall()]
 
     alias_map = {row["alias_key"]: row for row in alias_rows}
@@ -181,7 +202,11 @@ def list_prices() -> list[dict[str, Any]]:
         return (alias["canonical_key"], alias["canonical_name"]) if alias else (key, fallback_name)
 
     for row in price_rows:
+        if str(row.get("product_name") or "").strip().startswith("A"):
+            continue
         canonical_key, canonical_name = target_for(row["product_key"], row["product_name"])
+        if canonical_name.strip().startswith("A"):
+            continue
         bucket = groups.setdefault(canonical_key, {
             "product_key": canonical_key, "product_name": canonical_name,
             "member_keys": [], "order_count": 0, "_prices": [], "aliases": set(),
@@ -189,6 +214,8 @@ def list_prices() -> list[dict[str, Any]]:
         bucket["member_keys"].append(row["product_key"])
         bucket["_prices"].append(row)
     for row in count_rows:
+        if str(row.get("product_name") or "").strip().startswith("A"):
+            continue
         canonical_key, _canonical_name = target_for(row["product_key"])
         if canonical_key in groups:
             groups[canonical_key]["order_count"] += int(row["order_count"] or 0)
@@ -289,6 +316,75 @@ def save_product_group(primary_name: str, alias_names: list[str]) -> None:
                 """, (row["alias_key"], row["alias_name"], row["canonical_key"], row["canonical_name"]))
 
 
+def merge_product_groups(primary_name: str, selected_keys: list[str]) -> None:
+    """Merge selected existing catalog rows/groups under a chosen display name."""
+    from price_parser import canonical_product_name, product_key
+
+    canonical_name = canonical_product_name(primary_name)
+    canonical_key = product_key(canonical_name)
+    selected = {str(key) for key in selected_keys if str(key)}
+    if not canonical_key:
+        raise ValueError("请填写合并后的主要显示品名。")
+    if len(selected) < 2:
+        raise ValueError("请至少选择两个现有品种。")
+
+    with db_session() as db:
+        catalog = [dict(row) for row in db.execute(
+            "SELECT product_key, product_name FROM price_catalog"
+        ).fetchall()]
+        existing = [dict(row) for row in db.execute(
+            "SELECT alias_key, alias_name, canonical_key, canonical_name FROM product_aliases"
+        ).fetchall()]
+
+        alias_map = {row["alias_key"]: row for row in existing}
+        selected_groups = {
+            alias_map[key]["canonical_key"] if key in alias_map else key
+            for key in selected
+        }
+        # If the chosen display key already names a group, move that whole group too.
+        if canonical_key in alias_map:
+            selected_groups.add(alias_map[canonical_key]["canonical_key"])
+        selected_groups.update(
+            row["canonical_key"] for row in existing
+            if row["canonical_key"] == canonical_key
+        )
+
+        members: dict[str, str] = {canonical_key: canonical_name}
+        for row in catalog:
+            mapped = alias_map.get(row["product_key"])
+            group_key = mapped["canonical_key"] if mapped else row["product_key"]
+            if row["product_key"] in selected or group_key in selected_groups:
+                members[row["product_key"]] = row["product_name"]
+        for row in existing:
+            if row["canonical_key"] in selected_groups or row["alias_key"] in selected:
+                members[row["alias_key"]] = row["alias_name"]
+        # Keep the selected canonical identities even if a member has no current price row.
+        for key in selected:
+            if key in alias_map:
+                members[key] = alias_map[key]["alias_name"]
+            elif key not in members:
+                members[key] = next(
+                    (row["product_name"] for row in catalog if row["product_key"] == key), key
+                )
+
+        members[canonical_key] = canonical_name
+        selected_groups.add(canonical_key)
+        db.execute("DELETE FROM product_aliases")
+        for alias_key, alias_name in members.items():
+            db.execute(
+                """INSERT INTO product_aliases(alias_key, alias_name, canonical_key, canonical_name)
+                   VALUES (?, ?, ?, ?)""",
+                (alias_key, alias_name, canonical_key, canonical_name),
+            )
+        for row in existing:
+            if row["canonical_key"] not in selected_groups and row["alias_key"] not in members:
+                db.execute(
+                    """INSERT INTO product_aliases(alias_key, alias_name, canonical_key, canonical_name)
+                       VALUES (?, ?, ?, ?)""",
+                    (row["alias_key"], row["alias_name"], row["canonical_key"], row["canonical_name"]),
+                )
+
+
 def delete_product_group(canonical_key: str) -> None:
     """Remove a display grouping; original prices, history, and counts remain intact."""
     with db_session() as db:
@@ -309,11 +405,12 @@ def record_order_counts(sheet: dict[str, Any]) -> int:
     counts: dict[str, dict[str, Any]] = {}
     for item in sheet.get("rows", []):
         key = str(item.get("raw_key") or item.get("key") or "").strip()
-        if not key:
+        item_name = str(item.get("raw_name") or item.get("canonical_name") or item.get("product") or key)
+        if not key or item_name.strip().startswith("A"):
             continue
         if key not in counts:
             counts[key] = {
-                "name": item.get("raw_name") or item.get("canonical_name") or item.get("product") or key,
+                "name": item_name,
                 "count": 0,
             }
         counts[key]["count"] += 1
@@ -330,7 +427,13 @@ def record_order_counts(sheet: dict[str, Any]) -> int:
 
 def list_history(limit: int | None = 30) -> list[dict[str, Any]]:
     with db_session() as db:
-        rows = db.execute("SELECT * FROM price_history ORDER BY id DESC").fetchall()
+        if limit is None:
+            rows = db.execute("SELECT * FROM price_history ORDER BY id DESC").fetchall()
+        else:
+            # Alias members often produce the same visible history row. Fetch a bounded
+            # recent window and deduplicate it without scanning the full table per view.
+            fetch_limit = max(limit * 10, limit + 100)
+            rows = db.execute("SELECT * FROM price_history ORDER BY id DESC LIMIT ?", (fetch_limit,)).fetchall()
         aliases = {
             row["alias_key"]: dict(row)
             for row in db.execute("SELECT alias_key, canonical_key, canonical_name FROM product_aliases").fetchall()
@@ -339,10 +442,14 @@ def list_history(limit: int | None = 30) -> list[dict[str, Any]]:
     seen = set()
     for raw in rows:
         row = dict(raw)
+        if str(row.get("product_name") or "").strip().startswith("A"):
+            continue
         alias = aliases.get(row["product_key"])
         if alias:
             row["product_key"] = alias["canonical_key"]
             row["product_name"] = alias["canonical_name"]
+        if str(row.get("product_name") or "").strip().startswith("A"):
+            continue
         signature = (
             row["product_key"], row["source_date"], row["supplier_quote_jpy"],
             row["source"], row["updated_by"],

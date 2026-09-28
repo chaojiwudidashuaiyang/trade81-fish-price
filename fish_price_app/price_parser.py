@@ -1,4 +1,4 @@
-"""Read the two New Stone / Trade81 workbook layouts used by the prototype."""
+"""Read Trade81 price workbooks and normalize product names."""
 from __future__ import annotations
 
 from datetime import date, datetime
@@ -101,6 +101,9 @@ def read_price_template(file) -> dict[str, Any]:
         product = product.strip()
         if product.startswith("■"):
             continue
+        # Uppercase A-prefixed items are sea urchin lines handled by another owner.
+        if product.startswith("A"):
+            continue
         quote = _number(cells.get((r, 9)))
         rows.append({
             "product": product,
@@ -147,6 +150,8 @@ def read_order_template(file) -> dict[str, Any]:
                 continue
             product = value.strip()
             if not product or product.startswith("■") or product in {"產品名稱", "产品名称"}:
+                continue
+            if product.startswith("A"):
                 continue
             canonical = canonical_product_name(product)
             key = product_key(product)
