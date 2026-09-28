@@ -89,6 +89,14 @@ def connect() -> _Connection:
                 PRIMARY KEY(order_date, product_key)
             )
         """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS product_aliases (
+                alias_key TEXT PRIMARY KEY,
+                alias_name TEXT NOT NULL,
+                canonical_key TEXT NOT NULL,
+                canonical_name TEXT NOT NULL
+            )
+        """)
         db.execute("ALTER TABLE price_catalog ADD COLUMN IF NOT EXISTS updated_by TEXT NOT NULL DEFAULT ''")
         db.execute("ALTER TABLE price_history ADD COLUMN IF NOT EXISTS updated_by TEXT NOT NULL DEFAULT ''")
         db.commit()
@@ -129,6 +137,14 @@ def connect() -> _Connection:
             PRIMARY KEY(order_date, product_key)
         )
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS product_aliases (
+            alias_key TEXT PRIMARY KEY,
+            alias_name TEXT NOT NULL,
+            canonical_key TEXT NOT NULL,
+            canonical_name TEXT NOT NULL
+        )
+    """)
     # Add the audit field to a local database created by an earlier app version.
     for table in ("price_catalog", "price_history"):
         columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -153,18 +169,130 @@ def db_session():
 
 def list_prices() -> list[dict[str, Any]]:
     with db_session() as db:
+        price_rows = [dict(row) for row in db.execute("SELECT * FROM price_catalog").fetchall()]
+        count_rows = [dict(row) for row in db.execute("SELECT product_key, SUM(order_count) AS order_count FROM order_daily_counts GROUP BY product_key").fetchall()]
+        alias_rows = [dict(row) for row in db.execute("SELECT alias_key, alias_name, canonical_key, canonical_name FROM product_aliases").fetchall()]
+
+    alias_map = {row["alias_key"]: row for row in alias_rows}
+    groups: dict[str, dict[str, Any]] = {}
+
+    def target_for(key: str, fallback_name: str = "") -> tuple[str, str]:
+        alias = alias_map.get(key)
+        return (alias["canonical_key"], alias["canonical_name"]) if alias else (key, fallback_name)
+
+    for row in price_rows:
+        canonical_key, canonical_name = target_for(row["product_key"], row["product_name"])
+        bucket = groups.setdefault(canonical_key, {
+            "product_key": canonical_key, "product_name": canonical_name,
+            "member_keys": [], "order_count": 0, "_prices": [], "aliases": set(),
+        })
+        bucket["member_keys"].append(row["product_key"])
+        bucket["_prices"].append(row)
+    for row in count_rows:
+        canonical_key, _canonical_name = target_for(row["product_key"])
+        if canonical_key in groups:
+            groups[canonical_key]["order_count"] += int(row["order_count"] or 0)
+    for row in alias_rows:
+        if row["canonical_key"] in groups and row["alias_key"] != row["canonical_key"]:
+            groups[row["canonical_key"]]["aliases"].add(row["alias_name"])
+
+    result = []
+    for bucket in groups.values():
+        newest = max(bucket.pop("_prices"), key=lambda row: (row["source_date"], row["updated_at"], row["product_key"] == bucket["product_key"]))
+        bucket.update({key: newest[key] for key in ("supplier_quote_jpy", "source_date", "updated_at", "source", "updated_by")})
+        bucket["member_keys"] = sorted(set(bucket["member_keys"]))
+        bucket["aliases"] = sorted(bucket["aliases"])
+        result.append(bucket)
+    return sorted(result, key=lambda row: (-row["order_count"], row["product_name"].casefold()))
+
+
+def list_product_groups() -> list[dict[str, Any]]:
+    with db_session() as db:
         rows = db.execute("""
-            SELECT p.*,
-                   COALESCE(o.order_count, 0) AS order_count
-            FROM price_catalog AS p
-            LEFT JOIN (
-                SELECT product_key, SUM(order_count) AS order_count
-                FROM order_daily_counts
-                GROUP BY product_key
-            ) AS o ON o.product_key = p.product_key
-            ORDER BY COALESCE(o.order_count, 0) DESC, LOWER(p.product_name)
+            SELECT alias_key, alias_name, canonical_key, canonical_name
+            FROM product_aliases ORDER BY canonical_name, alias_name
         """).fetchall()
-    return [dict(row) for row in rows]
+    groups: dict[str, dict[str, Any]] = {}
+    for raw in rows:
+        row = dict(raw)
+        group = groups.setdefault(row["canonical_key"], {
+            "canonical_key": row["canonical_key"],
+            "canonical_name": row["canonical_name"],
+            "aliases": [],
+        })
+        if row["alias_key"] != row["canonical_key"] and row["alias_name"] != row["canonical_name"]:
+            group["aliases"].append(row["alias_name"])
+    return list(groups.values())
+
+
+def resolve_sheet_products(sheet: dict[str, Any]) -> dict[str, Any]:
+    """Attach custom display keys to rows, retaining raw keys for price/order storage."""
+    with db_session() as db:
+        aliases = {
+            row["alias_key"]: dict(row)
+            for row in db.execute("SELECT alias_key, alias_name, canonical_key, canonical_name FROM product_aliases").fetchall()
+        }
+    resolved = {**sheet, "rows": []}
+    for original in sheet.get("rows", []):
+        row = dict(original)
+        row.setdefault("raw_key", row.get("key", ""))
+        row.setdefault("raw_name", row.get("canonical_name") or row.get("product") or row.get("key", ""))
+        alias = aliases.get(row["raw_key"])
+        if alias:
+            row["key"] = alias["canonical_key"]
+            row["canonical_name"] = alias["canonical_name"]
+        resolved["rows"].append(row)
+    return resolved
+
+
+def save_product_group(primary_name: str, alias_names: list[str]) -> None:
+    """Add or combine user-defined names under one display name without deleting source rows."""
+    from price_parser import canonical_product_name, product_key
+
+    canonical_name = canonical_product_name(primary_name)
+    canonical_key = product_key(canonical_name)
+    if not canonical_key:
+        raise ValueError("请填写主要显示品名。")
+
+    submitted: dict[str, str] = {canonical_key: canonical_name}
+    for name in alias_names:
+        display_name = canonical_product_name(name)
+        key = product_key(display_name)
+        if key:
+            submitted[key] = display_name
+    if len(submitted) < 2:
+        raise ValueError("请至少填写一个需要合并的其他品名。")
+
+    with db_session() as db:
+        existing = [dict(row) for row in db.execute("SELECT alias_key, alias_name, canonical_key, canonical_name FROM product_aliases").fetchall()]
+        submitted_keys = set(submitted)
+        source_groups = {canonical_key}
+        source_groups.update(row["canonical_key"] for row in existing if row["alias_key"] in submitted_keys)
+        members = dict(submitted)
+        for row in existing:
+            if row["canonical_key"] in source_groups:
+                members[row["alias_key"]] = row["alias_name"]
+
+        # Existing groups touched by any selected name are reassigned as a whole.
+        db.execute("DELETE FROM product_aliases")
+        for alias_key, alias_name in members.items():
+            db.execute("""
+                INSERT INTO product_aliases(alias_key, alias_name, canonical_key, canonical_name)
+                VALUES (?, ?, ?, ?)
+            """, (alias_key, alias_name, canonical_key, canonical_name))
+        # Preserve untouched groups.
+        for row in existing:
+            if row["canonical_key"] not in source_groups and row["alias_key"] not in members:
+                db.execute("""
+                    INSERT INTO product_aliases(alias_key, alias_name, canonical_key, canonical_name)
+                    VALUES (?, ?, ?, ?)
+                """, (row["alias_key"], row["alias_name"], row["canonical_key"], row["canonical_name"]))
+
+
+def delete_product_group(canonical_key: str) -> None:
+    """Remove a display grouping; original prices, history, and counts remain intact."""
+    with db_session() as db:
+        db.execute("DELETE FROM product_aliases WHERE canonical_key=?", (canonical_key,))
 
 
 def record_order_counts(sheet: dict[str, Any]) -> int:
@@ -180,12 +308,12 @@ def record_order_counts(sheet: dict[str, Any]) -> int:
 
     counts: dict[str, dict[str, Any]] = {}
     for item in sheet.get("rows", []):
-        key = str(item.get("key") or "").strip()
+        key = str(item.get("raw_key") or item.get("key") or "").strip()
         if not key:
             continue
         if key not in counts:
             counts[key] = {
-                "name": item.get("canonical_name") or item.get("product") or key,
+                "name": item.get("raw_name") or item.get("canonical_name") or item.get("product") or key,
                 "count": 0,
             }
         counts[key]["count"] += 1
@@ -202,11 +330,30 @@ def record_order_counts(sheet: dict[str, Any]) -> int:
 
 def list_history(limit: int | None = 30) -> list[dict[str, Any]]:
     with db_session() as db:
-        if limit is None:
-            rows = db.execute("SELECT * FROM price_history ORDER BY id DESC").fetchall()
-        else:
-            rows = db.execute("SELECT * FROM price_history ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-    return [dict(row) for row in rows]
+        rows = db.execute("SELECT * FROM price_history ORDER BY id DESC").fetchall()
+        aliases = {
+            row["alias_key"]: dict(row)
+            for row in db.execute("SELECT alias_key, canonical_key, canonical_name FROM product_aliases").fetchall()
+        }
+    result = []
+    seen = set()
+    for raw in rows:
+        row = dict(raw)
+        alias = aliases.get(row["product_key"])
+        if alias:
+            row["product_key"] = alias["canonical_key"]
+            row["product_name"] = alias["canonical_name"]
+        signature = (
+            row["product_key"], row["source_date"], row["supplier_quote_jpy"],
+            row["source"], row["updated_by"],
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        result.append(row)
+        if limit is not None and len(result) >= limit:
+            break
+    return result
 
 
 def _record_change(db: _Connection, key: str, name: str, quote: float,
@@ -223,7 +370,7 @@ def apply_sheet(sheet: dict[str, Any], updated_by: str = "") -> dict[str, int]:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with db_session() as db:
         for item in sheet["rows"]:
-            key = item["key"]
+            key = item.get("raw_key") or item["key"]
             quote = item["fishmonger_quote_jpy"]
             if not key or quote is None:
                 continue
@@ -237,7 +384,7 @@ def apply_sheet(sheet: dict[str, Any], updated_by: str = "") -> dict[str, int]:
             if old and sheet["date"] == old["source_date"] and old["source"] == "价格表" and old["supplier_quote_jpy"] == quote:
                 skipped += 1
                 continue
-            name = item["canonical_name"] or item["product"]
+            name = item.get("raw_name") or item.get("canonical_name") or item["product"]
             db.execute("""
                 INSERT INTO price_catalog(product_key, product_name, supplier_quote_jpy, source_date, updated_at, source, updated_by)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -254,18 +401,20 @@ def apply_sheet(sheet: dict[str, Any], updated_by: str = "") -> dict[str, int]:
     return {"changed": changed, "skipped": skipped}
 
 
-def manual_update(key: str, quote: float, updated_by: str = "") -> None:
+def manual_update(key: str, quote: float, updated_by: str = "", member_keys: list[str] | None = None) -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with db_session() as db:
-        old = db.execute("SELECT * FROM price_catalog WHERE product_key=?", (key,)).fetchone()
-        if not old:
-            return
-        name = old["product_name"]
-        db.execute("""
-            UPDATE price_catalog SET supplier_quote_jpy=?, updated_at=?, source='手动修改', updated_by=?
-            WHERE product_key=?
-        """, (quote, now, updated_by, key))
-        _record_change(db, key, name, quote, old["source_date"], "手动修改", now, updated_by)
+        keys = sorted(set(member_keys or [key]))
+        for raw_key in keys:
+            old = db.execute("SELECT * FROM price_catalog WHERE product_key=?", (raw_key,)).fetchone()
+            if not old:
+                continue
+            name = old["product_name"]
+            db.execute("""
+                UPDATE price_catalog SET supplier_quote_jpy=?, updated_at=?, source='手动修改', updated_by=?
+                WHERE product_key=?
+            """, (quote, now, updated_by, raw_key))
+            _record_change(db, raw_key, name, quote, old["source_date"], "手动修改", now, updated_by)
 
 
 def export_backup_xlsx() -> bytes:
@@ -273,19 +422,35 @@ def export_backup_xlsx() -> bytes:
     catalog = wb.active
     catalog.title = "当前价格"
     catalog.append(["product_key", "product_name", "supplier_quote_jpy", "source_date", "updated_at", "source", "updated_by"])
-    for row in list_prices():
+    for row in list_raw_prices():
         catalog.append([row.get(k) for k in ("product_key", "product_name", "supplier_quote_jpy", "source_date", "updated_at", "source", "updated_by")])
     history = wb.create_sheet("更新历史")
     history.append(["product_key", "product_name", "supplier_quote_jpy", "source_date", "updated_at", "source", "updated_by"])
-    for row in reversed(list_history(limit=None)):
+    for row in reversed(list_raw_history()):
         history.append([row.get(k) for k in ("product_key", "product_name", "supplier_quote_jpy", "source_date", "updated_at", "source", "updated_by")])
     counts = wb.create_sheet("每日下单统计")
     counts.append(["order_date", "product_key", "product_name", "order_count"])
     for row in list_order_counts():
         counts.append([row.get(k) for k in ("order_date", "product_key", "product_name", "order_count")])
+    groups = wb.create_sheet("品名归并")
+    groups.append(["alias_key", "alias_name", "canonical_key", "canonical_name"])
+    for row in list_alias_rows():
+        groups.append([row.get(k) for k in ("alias_key", "alias_name", "canonical_key", "canonical_name")])
     stream = BytesIO()
     wb.save(stream)
     return stream.getvalue()
+
+
+def list_raw_prices() -> list[dict[str, Any]]:
+    with db_session() as db:
+        rows = db.execute("SELECT * FROM price_catalog ORDER BY LOWER(product_name)").fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_raw_history() -> list[dict[str, Any]]:
+    with db_session() as db:
+        rows = db.execute("SELECT * FROM price_history ORDER BY id").fetchall()
+    return [dict(row) for row in rows]
 
 
 def list_order_counts() -> list[dict[str, Any]]:
@@ -294,6 +459,15 @@ def list_order_counts() -> list[dict[str, Any]]:
             SELECT order_date, product_key, product_name, order_count
             FROM order_daily_counts
             ORDER BY order_date, product_key
+        """).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_alias_rows() -> list[dict[str, Any]]:
+    with db_session() as db:
+        rows = db.execute("""
+            SELECT alias_key, alias_name, canonical_key, canonical_name
+            FROM product_aliases ORDER BY canonical_name, alias_name
         """).fetchall()
     return [dict(row) for row in rows]
 
@@ -351,4 +525,19 @@ def import_backup_xlsx(file) -> int:
                     str(row.get("order_date") or ""), str(row.get("product_key") or ""),
                     str(row.get("product_name") or ""), int(row.get("order_count") or 0),
                 ))
+        if "品名归并" in wb.sheetnames:
+            groups_ws = wb["品名归并"]
+            group_headers = [cell.value for cell in groups_ws[1]]
+            for values in groups_ws.iter_rows(min_row=2, values_only=True):
+                if not any(v is not None for v in values):
+                    continue
+                row = dict(zip(group_headers, values))
+                db.execute("""
+                    INSERT INTO product_aliases(alias_key, alias_name, canonical_key, canonical_name)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(alias_key) DO UPDATE SET
+                        alias_name=excluded.alias_name,
+                        canonical_key=excluded.canonical_key,
+                        canonical_name=excluded.canonical_name
+                """, tuple(str(row.get(k) or "") for k in ("alias_key", "alias_name", "canonical_key", "canonical_name")))
     return len(records)

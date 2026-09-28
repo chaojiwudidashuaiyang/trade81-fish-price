@@ -16,6 +16,7 @@ ALIASES = {
     "油金": "ハマチ",
     "蜜柑鯛": "みかん鯛",
     "蜜甘鯛": "みかん鯛",
+    "蜜柑鲷": "みかん鯛",
     # Trade81 order lists use both Japanese and Chinese names for farmed yellowtail.
     "養殖油甘魚": "ハマチ",
     "养殖油甘鱼": "ハマチ",
@@ -61,6 +62,9 @@ def canonical_product_name(value: Any) -> str:
     text = re.sub(r"（[^）]*）|\([^)]*\)", "", text)
     text = re.sub(r"[×x＊*]\s*\d+(?:\.\d+)?\s*(?:尾|匹|個|枚|本|箱|p|パック)?", "", text)
     text = re.sub(r"\d+(?:\.\d+)?\s*(?:尾|匹|個|枚|本|箱)\s*$", "", text)
+    # Some order rows append the ordered quantity as a bare number after a size,
+    # e.g. "みかん鯛 1.8 kg 1". Keep the size and remove only that final count.
+    text = re.sub(r"((?:\d+(?:\.\d+)?)\s*(?:kg|g|玉))\s+\d+\s*$", r"\1", text, flags=re.IGNORECASE)
     for old, new in sorted(ALIASES.items(), key=lambda item: len(item[0]), reverse=True):
         text = text.replace(old, new)
     # A description may list two synonymous names side by side, such as

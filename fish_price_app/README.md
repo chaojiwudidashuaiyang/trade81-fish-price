@@ -1,10 +1,10 @@
-# Trade81 海鲜价格库：免费共享版准备包
+# Trade81 海鲜价格库
 
-此版本保留本机 SQLite 模式，也支持 Supabase PostgreSQL 共享数据库、Google 登录、管理员 / 只读权限和本机数据迁移。价格页为全宽查看，默认按累计下单行数排序；管理员的上传、手动修改及迁移操作放在折叠工具区。
+支持本机 SQLite 与 Supabase PostgreSQL 共享数据库、Google 登录、管理员 / 只读权限，以及商品别名归并。价格以日元保存；销售参考价按鱼商报价加 5% 显示。
 
 ## 本机启动
 
-在程序目录打开命令窗口：
+在程序目录打开命令提示符：
 
 ```bat
 python -m venv .venv
@@ -20,54 +20,49 @@ python -m streamlit run app.py
 python -m streamlit run app.py
 ```
 
-Windows 本机数据仍保存在 `%LOCALAPPDATA%\Trade81FishPrice\prices.db`。
+本机数据保存在 `%LOCALAPPDATA%\Trade81FishPrice\prices.db`。
 
-## 免费云端试运行的顺序
+## 每日价格更新
 
-### 1. 上传程序到 GitHub 仓库
+管理员在应用左侧“更新当天价格”上传当天最新价格表即可，不需要再上传前一天的表，也不需要单独上传下单表。系统会：
 
-Streamlit Community Cloud 免费公开部署需要公开仓库，因此本项目仓库为 **Public**。任何人都能查看程序代码；价格数据放在 Supabase，数据库和 OAuth 密钥只放在 Streamlit Secrets。不要上传 `.venv`、价格数据库文件或真实的 `secrets.toml`。`.gitignore` 已排除这些内容。
+- 更新文件中出现的商品价格；文件未出现的商品保留原价格。
+- 按每个商品行出现次数累计下单次数；同一天重传会替换该日计数，不会重复加总。
+- 检查同一商品是否出现多个报价；有冲突的商品不会自动改价，其他商品照常更新。
 
-### 2. 创建 Supabase 免费项目
+## 手动归并商品名称
 
-在 Supabase 建立一个 Free 项目，然后从数据库连接设置复制 PostgreSQL 连接 URI。给 Streamlit 使用时选择 Session Pooler URI；保管好数据库密码。
+在左侧“归并相同品种”中填写主要显示品名和其他写法，每行一个别名。例如：
 
-### 3. 部署到 Streamlit Community Cloud
+主要显示品名：`みかん鯛`
 
-使用 GitHub 账号登录 Streamlit Community Cloud，选择仓库并部署 `fish_price_app/app.py`。应用网页需要 Google 登录，Secrets 里的访问名单决定管理员和只读用户。
+```text
+蜜柑鲷
+養殖ミカンタイ みかん鯛 1.8 kg 1
+```
 
-### 4. 在 Streamlit 的 Secrets 中填入配置
+保存后，匹配到的商品价格、下单次数和更新记录会合并显示在主要品名下。取消归并会恢复原始商品的分别显示；原始价格和历史记录不会删除。
 
-在 App settings → Secrets 中，按 `.streamlit/secrets.toml.example` 填入：
+## 云端配置
 
-- `SUPABASE_DB_URL`：Supabase 的 PostgreSQL URI。
-- `[auth]`：Google OAuth Client ID、Client Secret、随机 cookie secret，以及部署后的 `redirect_uri`。
-- `[access]`：你自己的邮箱放在 `admin_emails`；同事邮箱放在 `viewer_emails`。
+Streamlit Community Cloud 应用需在 App settings → Secrets 配置：
 
-不要把真实密码、Client Secret 或连接 URI 提交到 GitHub，也不要发到聊天中。
+- `SUPABASE_DB_URL`：Supabase PostgreSQL 连接 URI。
+- `[auth]`：Google OAuth Client ID、Client Secret、随机 cookie secret 和部署后的 `redirect_uri`。
+- `[access]`：管理员邮箱放入 `admin_emails`，同事邮箱放入 `viewer_emails`。
 
-下单次数按两份已上传的订单 / 价格模板中商品行出现次数累计，不按数量列换算。同一天模板再次上传时会替换该日计数，因此重复上传不会重复加总。也可以上传“每日下单表”单独更新某一天的统计，不修改价格。若要统计程序启用前的历史订单，需要补传历史日期模板或每日下单表。
+参考 `.streamlit/secrets.toml.example`。真实连接 URI、数据库密码、OAuth 密钥和 `secrets.toml` 不要提交到 GitHub。
 
-### 5. 配置 Google 登录
-
-在 Google Auth Platform 创建一个 Web application OAuth Client。在 Authorized redirect URIs 加入：
+Google Auth Platform 处于 Testing 时，需要把每个登录账号添加到测试用户。部署时 Google OAuth 的 Authorized redirect URI 应为：
 
 ```text
 https://YOUR-APP.streamlit.app/oauth2callback
 ```
 
-将 Client ID 和 Client Secret 放入 Streamlit Secrets。Google OAuth 处于 Testing 时，需要把登录账号加到测试用户；准备让同事登录时，再按 Google 页面要求发布登录同意屏幕。
+## 本机数据迁移
 
-### 6. 邀请同事
+先在本机应用左侧下载“价格库备份”，再用云端管理员账号上传迁移。迁移只允许写入空数据库，不会覆盖云端已有数据。备份包含当前价格、更新历史、下单统计和品名归并规则。
 
-在应用处于 Google OAuth 测试模式时，把同事邮箱加入 Google Auth Platform 的“目标对象 → 测试用户”，并在 Streamlit Secrets 的 `viewer_emails` 中加入他们。管理员邮箱只放进 `admin_emails`，因此只有管理员可以上传价格表和手动修改。
+## 依赖与安全
 
-### 7. 迁移本机价格
-
-在当前本机程序左侧点“下载价格库备份 / 迁移文件”。登录云端管理员账号，在右侧“从本机迁移价格库”上传该文件。迁移只允许写入空的云端价格库，以免覆盖已共享数据。
-
-## 免费方案的限制
-
-- Streamlit Community Cloud 的应用连续 12 小时没有访问会休眠；有人打开后可以唤醒。
-- Supabase Free 项目连续一周无活动会暂停。该方案适合试运行，长期业务使用前要考虑备份与可用性。
-- 仓库代码公开，但应用页面要求 Google 登录；Secrets 访问名单会区分管理员和只读同事。
+代码仓库在 Streamlit Community Cloud 免费方案下需要公开；页面仍要求 Google 登录。数据库和 OAuth 凭据只保存在部署 Secrets 中。不要上传 `.venv`、价格数据库或任何真实密钥。

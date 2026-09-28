@@ -4,10 +4,11 @@ import os
 import pandas as pd
 import streamlit as st
 
-from price_parser import group_price_rows, read_order_template, read_price_template
+from price_parser import group_price_rows, read_price_template
 from price_store import (
-    apply_sheet, configure_database, export_backup_xlsx, import_backup_xlsx,
-    list_history, list_prices, manual_update, record_order_counts,
+    apply_sheet, configure_database, delete_product_group, export_backup_xlsx,
+    import_backup_xlsx, list_history, list_prices, list_product_groups,
+    manual_update, record_order_counts, resolve_sheet_products, save_product_group,
 )
 
 
@@ -24,21 +25,16 @@ def secret(name, default=None):
 
 def secret_section(name):
     value = secret(name, {})
-    try:
-        return value if value else {}
-    except Exception:
-        return {}
+    return value if value else {}
 
 
 def table_height(row_count: int, cap: int = 1400) -> int:
-    """Give tables room to breathe while leaving long lists to normal page scroll."""
     return min(cap, max(180, 42 + row_count * 34))
 
 
 database_url = secret("SUPABASE_DB_URL") or os.getenv("SUPABASE_DB_URL")
 configure_database(database_url)
 local_mode = bool(os.getenv("LOCALAPPDATA") or os.getenv("TRADE81_LOCAL_MODE") == "1")
-
 auth_config = secret_section("auth")
 access_config = secret_section("access")
 
@@ -77,13 +73,112 @@ else:
         st.stop()
     email, role = "本机管理员", "admin"
 
-account_col, logout_col = st.columns([8, 1])
-account_col.caption("管理员权限" if role == "admin" else "价格只读查看")
-if auth_config and logout_col.button("退出登录"):
-    st.logout()
+with st.sidebar:
+    st.header("价格库管理")
+    st.caption("管理员工具 · 只上传当天最新价格表")
+    if auth_config:
+        st.caption("当前账号：" + ("管理员" if role == "admin" else "只读查看"))
+        if st.button("退出登录", key="sidebar_logout"):
+            st.logout()
 
-if st.session_state.get("price_flash"):
-    st.success(st.session_state.pop("price_flash"))
+    if role == "admin":
+        current = list_prices()
+        with st.expander("更新当天价格", expanded=True):
+            st.caption("上传当天价格表即可。文件中没有的商品沿用库内价格；同日重复上传会替换该日的下单次数。")
+            price_file = st.file_uploader("今日最新价格表（.xlsx）", type=["xlsx"], key="today_price_file")
+            if st.button("更新价格库", type="primary", disabled=price_file is None, use_container_width=True):
+                try:
+                    price_file.seek(0)
+                    incoming = read_price_template(price_file)
+                    if not incoming.get("date"):
+                        raise ValueError("无法从价格表第 5 行读取日期。")
+                    resolved = resolve_sheet_products(incoming)
+                    unique, conflicts = group_price_rows(resolved)
+                    allowed_rows = [row for row in resolved["rows"] if row["key"] not in conflicts]
+                    price_stats = apply_sheet({**resolved, "rows": allowed_rows}, updated_by=email)
+                    order_lines = record_order_counts(resolved)
+                    conflict_names = [
+                        next((row["canonical_name"] for row in resolved["rows"] if row["key"] == key), key)
+                        for key in conflicts
+                    ]
+                    message = (
+                        f"{incoming['date']} 已处理：价格新增或更新 {price_stats['changed']} 项，"
+                        f"未变或较旧而跳过 {price_stats['skipped']} 项；累计下单统计已记录 {order_lines} 行。"
+                    )
+                    if conflict_names:
+                        message += " 报价冲突、未自动更新的归并商品：" + "、".join(conflict_names)
+                    st.session_state["price_flash"] = message
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"读取或更新失败：{exc}")
+
+        with st.expander("归并相同品种", expanded=False):
+            st.caption("把不同写法归到同一商品名。每行填写一个别名；归并后价格和下单次数合并显示。")
+            with st.form("product_group_form", clear_on_submit=True):
+                primary = st.text_input("主要显示品名", placeholder="例如：みかん鯛")
+                aliases_text = st.text_area(
+                    "要归并的其他品名（每行一个）",
+                    placeholder="蜜柑鲷\n養殖ミカンタイ みかん鯛 1.8 kg 1",
+                    height=100,
+                )
+                save_group = st.form_submit_button("保存归并规则", use_container_width=True)
+            if save_group:
+                try:
+                    names = [line.strip() for line in aliases_text.splitlines() if line.strip()]
+                    save_product_group(primary, names)
+                    st.session_state["price_flash"] = f"已将相关写法归并到「{primary.strip()}」。"
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"保存归并失败：{exc}")
+            groups = list_product_groups()
+            if groups:
+                st.markdown("**已设置的归并**")
+                for index, group in enumerate(groups):
+                    aliases_label = "、".join(group["aliases"]) or "暂无别名"
+                    st.caption(f"{group['canonical_name']} ← {aliases_label}")
+                    if st.button("取消此归并", key=f"ungroup_{index}"):
+                        delete_product_group(group["canonical_key"])
+                        st.session_state["price_flash"] = f"已取消「{group['canonical_name']}」的归并；原始商品记录已恢复显示。"
+                        st.rerun()
+
+        if current:
+            with st.expander("手动修改价格", expanded=False):
+                by_key = {row["product_key"]: row for row in current}
+                selected = st.selectbox(
+                    "选择商品", list(by_key),
+                    format_func=lambda key: by_key[key]["product_name"],
+                    key="manual_product",
+                )
+                selected_row = by_key[selected]
+                with st.form("manual_price_edit"):
+                    edited_quote = st.number_input(
+                        "鱼商报价（¥）", min_value=0.0,
+                        value=float(selected_row["supplier_quote_jpy"]), step=100.0,
+                    )
+                    st.caption("归并商品会同时修改组内各原始商品；后续较新日期的价格表仍可更新它们。")
+                    if st.form_submit_button("保存手动价格", use_container_width=True):
+                        manual_update(selected, edited_quote, updated_by=email, member_keys=selected_row["member_keys"])
+                        st.session_state["price_flash"] = "已保存手动价格。"
+                        st.rerun()
+
+        st.download_button(
+            "下载价格库备份",
+            data=export_backup_xlsx(),
+            file_name="Trade81_价格库备份.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        if database_url and not current:
+            with st.expander("从本机迁移旧价格库", expanded=False):
+                st.caption("仅用于首次迁移到空云端价格库。")
+                backup_file = st.file_uploader("备份文件（.xlsx）", type=["xlsx"], key="migration_backup")
+                if st.button("导入旧价格与历史", disabled=backup_file is None):
+                    try:
+                        count = import_backup_xlsx(backup_file)
+                        st.session_state["price_flash"] = f"已迁移 {count} 条商品价格及更新记录。"
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"迁移失败：{exc}")
 
 try:
     current = list_prices()
@@ -91,26 +186,25 @@ except Exception as exc:
     st.error(f"无法连接价格数据库：{exc}")
     st.stop()
 
-# Full-width sales view: no side-by-side price and upload panels.
+if st.session_state.get("price_flash"):
+    st.success(st.session_state.pop("price_flash"))
+
 st.subheader("海鲜价格与下单热度")
 if current:
     total_order_occurrences = sum(int(row.get("order_count", 0) or 0) for row in current)
-    product_count = len(current)
     latest_catalog_date = max((str(row.get("source_date", "")) for row in current), default="—")
     metric_cols = st.columns(3)
-    metric_cols[0].metric("商品品种数", f"{product_count:,}")
+    metric_cols[0].metric("商品品种数", f"{len(current):,}")
     metric_cols[1].metric("累计下单行数", f"{total_order_occurrences:,}")
     metric_cols[2].metric("最近价格表日期", latest_catalog_date or "—")
 
     filter_col, sort_col = st.columns([3, 1])
     search = filter_col.text_input("搜索品种 / Size", key="catalog_search", placeholder="例如：ハマチ、350g")
     sort_mode = sort_col.selectbox(
-        "排列方式",
-        ["下单次数（高到低）", "最近更新时间（新到旧）", "品种名称（A 到 Z）"],
+        "排列方式", ["下单次数（高到低）", "最近更新时间（新到旧）", "品种名称（A 到 Z）"],
         key="catalog_sort",
     )
-
-    shown = [row for row in current if not search or search.casefold() in row["product_name"].casefold()]
+    shown = [row for row in current if not search or search.casefold() in row["product_name"].casefold() or any(search.casefold() in name.casefold() for name in row.get("aliases", []))]
     if sort_mode == "最近更新时间（新到旧）":
         shown.sort(key=lambda row: str(row.get("updated_at", "")), reverse=True)
     elif sort_mode == "品种名称（A 到 Z）":
@@ -126,23 +220,17 @@ if current:
         "价格表日期": row["source_date"],
         "最近更新时间": row["updated_at"],
     } for row in shown])
-    st.dataframe(
-        catalog_df,
-        use_container_width=True,
-        hide_index=True,
-        height=table_height(len(catalog_df)),
-        column_config={
-            "品种 / Size": st.column_config.TextColumn(width="large"),
-            "下单次数": st.column_config.NumberColumn(width="small", format="%d"),
-            "鱼商报价(¥)": st.column_config.NumberColumn(width="small", format="¥%.2f"),
-            "加 5% 后(¥)": st.column_config.NumberColumn(width="small", format="¥%.2f"),
-            "价格表日期": st.column_config.TextColumn(width="small"),
-            "最近更新时间": st.column_config.TextColumn(width="medium"),
-        },
-    )
-    st.caption("下单次数按上传模板中每个商品行累计（同一商品在不同餐厅的订单分别计次，不按数量折算）。重传同一天模板会更新该日统计，不会重复累计。")
+    st.dataframe(catalog_df, use_container_width=True, hide_index=True, height=table_height(len(catalog_df)), column_config={
+        "品种 / Size": st.column_config.TextColumn(width="large"),
+        "下单次数": st.column_config.NumberColumn(width="small", format="%d"),
+        "鱼商报价(¥)": st.column_config.NumberColumn(width="small", format="¥%.2f"),
+        "加 5% 后(¥)": st.column_config.NumberColumn(width="small", format="¥%.2f"),
+        "价格表日期": st.column_config.TextColumn(width="small"),
+        "最近更新时间": st.column_config.TextColumn(width="medium"),
+    })
+    st.caption("下单次数按价格表中的商品行累计；同一商品出现在不同餐厅的订单分别计次，不按数量折算。上传文件缺少的品种沿用价格库现有数据。")
 else:
-    st.info("价格库目前为空。管理员可在下方“管理员工具”中迁移本机价格库或上传模板。")
+    st.info("价格库目前为空。管理员可在左侧迁移本机价格库，或上传当天价格表。")
 
 st.subheader("最近价格更新记录")
 history = list_history(100)
@@ -157,171 +245,13 @@ if history:
         "更新来源": row["source"],
         "操作人": row.get("updated_by", ""),
     } for row in visible_history])
-    st.dataframe(
-        history_df,
-        use_container_width=True,
-        hide_index=True,
-        height=table_height(len(history_df)),
-        column_config={
-            "品种 / Size": st.column_config.TextColumn(width="large"),
-            "鱼商报价(¥)": st.column_config.NumberColumn(width="small", format="¥%.2f"),
-            "价格表日期": st.column_config.TextColumn(width="small"),
-            "更新时间": st.column_config.TextColumn(width="medium"),
-            "更新来源": st.column_config.TextColumn(width="small"),
-            "操作人": st.column_config.TextColumn(width="medium"),
-        },
-    )
+    st.dataframe(history_df, use_container_width=True, hide_index=True, height=table_height(len(history_df)), column_config={
+        "品种 / Size": st.column_config.TextColumn(width="large"),
+        "鱼商报价(¥)": st.column_config.NumberColumn(width="small", format="¥%.2f"),
+        "价格表日期": st.column_config.TextColumn(width="small"),
+        "更新时间": st.column_config.TextColumn(width="medium"),
+        "更新来源": st.column_config.TextColumn(width="small"),
+        "操作人": st.column_config.TextColumn(width="medium"),
+    })
 else:
     st.caption("还没有价格更新记录。")
-
-if role == "admin":
-    with st.expander("管理员工具：更新价格、手动修改与数据迁移", expanded=bool(st.session_state.get("price_compare_report"))):
-        if current:
-            by_key = {row["product_key"]: row for row in current}
-            st.markdown("**手动修改鱼商报价**")
-            selected = st.selectbox(
-                "选择商品", list(by_key),
-                format_func=lambda key: by_key[key]["product_name"],
-                key="manual_product",
-            )
-            selected_row = by_key[selected]
-            with st.form("manual_price_edit"):
-                edited_quote = st.number_input(
-                    "鱼商报价（¥）", min_value=0.0, value=float(selected_row["supplier_quote_jpy"]),
-                    step=100.0, key=f"quote_{selected}",
-                )
-                st.caption("修改的是鱼商报价；实际进货成本会自动加 5%。较新日期的价格表会覆盖手动值。")
-                save_manual = st.form_submit_button("保存手动价格")
-            if save_manual:
-                manual_update(selected, edited_quote, updated_by=email)
-                st.session_state["price_flash"] = "已保存手动价格。"
-                st.rerun()
-
-            st.download_button(
-                "下载价格库备份 / 迁移文件",
-                data=export_backup_xlsx(),
-                file_name="Trade81_价格库备份.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-        if database_url and not current:
-            st.markdown("**从本机迁移价格库**")
-            st.caption("先在本机版下载“价格库备份 / 迁移文件”，再上传到这里。只能导入到空价格库。")
-            backup_file = st.file_uploader("本机价格库备份（.xlsx）", type=["xlsx"], key="migration_backup")
-            if st.button("导入本机价格与历史", disabled=backup_file is None):
-                try:
-                    count = import_backup_xlsx(backup_file)
-                    st.session_state["price_flash"] = f"已迁移 {count} 条商品价格及更新记录。"
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"迁移失败：{exc}")
-
-        st.markdown("**补录每日下单记录**")
-        st.caption("上传每日下单表即可更新该日期的商品下单次数，不会改动价格。同一天重传会覆盖该日计数。")
-        order_file = st.file_uploader("每日下单表（.xlsx）", type=["xlsx"], key="daily_order_count_file")
-        if st.button("更新这一天的下单次数", disabled=order_file is None):
-            try:
-                order_file.seek(0)
-                order_sheet = read_order_template(order_file)
-                total_lines = record_order_counts(order_sheet)
-                st.session_state["price_flash"] = f"已更新 {order_sheet['date']} 的下单统计：{total_lines} 条商品订单行。"
-                st.rerun()
-            except Exception as exc:
-                st.error(f"读取下单表失败：{exc}")
-
-        st.markdown("**上传两天的订单 / 价格模板**")
-        st.caption("系统用模板更新价格，并统计每个商品在模板中出现的订单行数。餐厅和箱号不参与匹配；新表缺少的商品沿用已知价格。")
-        old_file = st.file_uploader("① 较早一天的模板（.xlsx）", type=["xlsx"], key="older_price")
-        new_file = st.file_uploader("② 较新一天的模板（.xlsx）", type=["xlsx"], key="newer_price")
-
-        if st.button("比对并更新共享价格库", type="primary", disabled=not (old_file and new_file)):
-            st.session_state.pop("price_compare_report", None)
-            try:
-                old_file.seek(0)
-                new_file.seek(0)
-                older = read_price_template(old_file)
-                newer = read_price_template(new_file)
-                if not older["date"] or not newer["date"]:
-                    st.error("无法从模板标题读取日期，请确认价格模板第 5 行包含日期。")
-                elif older["date"] >= newer["date"]:
-                    st.error(f"日期顺序不正确：较早模板是 {older['date']}，较新模板是 {newer['date']}。请调整上传位置。")
-                else:
-                    old_map, old_conflicts = group_price_rows(older)
-                    new_map, new_conflicts = group_price_rows(newer)
-                    old_stats = apply_sheet({**older, "rows": [r for r in older["rows"] if r["key"] not in old_conflicts]}, updated_by=email)
-                    new_stats = apply_sheet({**newer, "rows": [r for r in newer["rows"] if r["key"] not in new_conflicts]}, updated_by=email)
-                    old_order_lines = record_order_counts(older)
-                    new_order_lines = record_order_counts(newer)
-
-                    report = []
-                    all_keys = set(old_map) | set(new_map) | set(old_conflicts) | set(new_conflicts)
-                    for key in sorted(all_keys):
-                        old_item = old_map.get(key)
-                        new_item = new_map.get(key)
-                        example = new_item or old_item or next(
-                            (r for r in newer["rows"] + older["rows"] if r["key"] == key), None
-                        )
-                        if example is None:
-                            continue
-                        if key in new_conflicts:
-                            status = "新表同品种有多个报价，未自动更新"
-                            new_quote = None
-                        elif new_item and old_item:
-                            status = "价格有变化" if new_item["fishmonger_quote_jpy"] != old_item["fishmonger_quote_jpy"] else "价格相同"
-                            new_quote = new_item["fishmonger_quote_jpy"]
-                        elif new_item:
-                            status = "新表价格（旧表有多个报价）" if key in old_conflicts else "新表新增品种"
-                            new_quote = new_item["fishmonger_quote_jpy"]
-                        else:
-                            status = "新表未出现，沿用较早价格"
-                            new_quote = old_item["fishmonger_quote_jpy"] if old_item else None
-                        old_quote = old_item["fishmonger_quote_jpy"] if old_item else None
-                        report.append({
-                            "品种 / Size": example["canonical_name"],
-                            "较早价格(¥)": old_quote,
-                            "较新价格(¥)": new_quote,
-                            "差额(¥)": round(new_quote - old_quote, 2) if old_quote is not None and new_quote is not None else None,
-                            "处理结果": status,
-                            "key": key,
-                        })
-                    st.session_state["price_compare_report"] = {
-                        "older_date": older["date"], "newer_date": newer["date"],
-                        "rows": report, "older_stats": old_stats, "newer_stats": new_stats,
-                        "old_order_lines": old_order_lines, "new_order_lines": new_order_lines,
-                        "old_conflicts": old_conflicts, "new_conflicts": new_conflicts,
-                    }
-                    st.session_state["price_flash"] = (
-                        f"已比较 {older['date']} 与 {newer['date']}："
-                        f"较早表更新 {old_stats['changed']} 项，较新表更新 {new_stats['changed']} 项；"
-                        f"统计订单行 {old_order_lines + new_order_lines} 条。"
-                    )
-                    st.rerun()
-            except Exception as exc:
-                st.error(f"读取或更新失败：{exc}")
-
-        report = st.session_state.get("price_compare_report")
-        if report:
-            st.markdown(f"**比较结果：{report['older_date']} → {report['newer_date']}**")
-            visible_rows = [{k: v for k, v in row.items() if k != "key"} for row in report["rows"]]
-            if visible_rows:
-                st.dataframe(
-                    pd.DataFrame(visible_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                    height=table_height(len(visible_rows)),
-                    column_config={
-                        "较早价格(¥)": st.column_config.NumberColumn(format="¥%.2f"),
-                        "较新价格(¥)": st.column_config.NumberColumn(format="¥%.2f"),
-                        "差额(¥)": st.column_config.NumberColumn(format="¥%.2f"),
-                    },
-                )
-            if report["new_conflicts"]:
-                conflict_rows = [{
-                    "品种 / Size": key,
-                    "发现报价(¥)": " / ".join(str(v) for v in values),
-                } for key, values in report["new_conflicts"].items()]
-                st.warning("新价格表有同规格的不同报价，相关项目没有自动更新，请先核对。")
-                st.dataframe(pd.DataFrame(conflict_rows), use_container_width=True, hide_index=True)
-
-with st.expander("价格规则与免费版说明"):
-    st.markdown("鱼商报价统一加 5% 作为实际进货成本；全部按日元，不做汇率换算。云端共享数据存于 Supabase；免费数据库若一周无活动会暂停。Streamlit Community Cloud 应用若 12 小时无人访问会休眠。")
